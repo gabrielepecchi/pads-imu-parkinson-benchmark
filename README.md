@@ -4,6 +4,25 @@ A benchmarking pipeline that evaluates classical machine learning and deep learn
 
 ---
 
+## What this project proves
+
+- **Leakage-aware biomedical ML pipeline design:** all learned and statistical transformations, model fitting, and evaluation are performed within fold boundaries; no normalisation statistics or model parameters are derived from test subjects.
+- **Subject-independent evaluation:** subjects are never split across folds, producing generalisation estimates that are more realistic than record-level splits.
+- **Train-fold-only normalisation:** z-score statistics (feature and sequence) are fitted exclusively on training data and applied to test data, preventing a common and often-overlooked source of leakage.
+- **Reproducible comparison of classical ML and 1D-CNN models:** all randomness is controlled via a single seed; the pipeline is designed to be reproducible under the same dataset, configuration, and environment.
+- **Honest reporting of modest but meaningful results:** metrics are reported as mean ± std across five folds, without cherry-picking or threshold manipulation.
+
+---
+
+## What this project does not prove
+
+- **Clinical readiness:** the pipeline is a research benchmark, not a validated diagnostic tool.
+- **Generalisation to all Parkinson's populations:** results are specific to the PADS dataset and its recruitment protocol; performance on other cohorts is unknown.
+- **Diagnostic reliability without larger external validation:** the PADS HC cohort is small; per-fold variance is high and confidence intervals are wide.
+- **Superiority over specialised clinical models:** no comparison is made against clinician assessment or domain-specific models trained on larger, multi-site datasets.
+
+---
+
 ## Table of Contents
 
 1. [Project Overview](#project-overview)
@@ -15,16 +34,17 @@ A benchmarking pipeline that evaluates classical machine learning and deep learn
 7. [Implemented Models](#implemented-models)
 8. [Evaluation Metrics](#evaluation-metrics)
 9. [Benchmark Results](#benchmark-results)
-10. [Installation](#installation)
-11. [CUDA / GPU Notes](#cuda--gpu-notes)
-12. [Dataset Folder Structure](#dataset-folder-structure)
-13. [Usage](#usage)
-14. [Results Files](#results-files)
-15. [Current Limitations](#current-limitations)
-16. [Future Improvements](#future-improvements)
-17. [Reproducibility](#reproducibility)
-18. [License](#license)
-19. [Citation](#citation)
+10. [Main Takeaway](#main-takeaway)
+11. [Installation](#installation)
+12. [CUDA / GPU Notes](#cuda--gpu-notes)
+13. [Dataset Folder Structure](#dataset-folder-structure)
+14. [Usage](#usage)
+15. [Results Files](#results-files)
+16. [Current Limitations](#current-limitations)
+17. [Future Improvements](#future-improvements)
+18. [Reproducibility](#reproducibility)
+19. [License](#license)
+20. [Citation](#citation)
 
 ---
 
@@ -39,7 +59,7 @@ The design strictly enforces subject independence — all records from a given s
 ## Objectives
 
 - Establish a clean, reproducible baseline for PD vs. HC classification on the PADS wrist IMU benchmark.
-- Enforce subject-independent evaluation to produce generalisation estimates that are meaningful in a clinical deployment context.
+- Enforce subject-independent evaluation to produce generalisation estimates that are more realistic than record-level splits.
 - Compare classical feature-engineering pipelines (Logistic Regression, Random Forest) against an end-to-end deep learning approach (1D CNN v2).
 - Report Balanced Accuracy, AUROC, Sensitivity (PD), and Specificity (HC) across five folds, with mean ± standard deviation, to reflect class imbalance and ranking performance simultaneously.
 
@@ -104,7 +124,7 @@ All configuration is centralised in `pipeline.yaml`. Running `run_pipeline.py` e
 
 ## Preprocessing Pipeline
 
-Preprocessing is performed once on the full dataset before any fold split, using `preprocessor.py`.
+Preprocessing is performed once on the full dataset before any fold split, using `preprocessor.py`. The steps below are non-learned signal transformations; all statistical transformations (normalisation) are computed per fold from training data only.
 
 ### Steps
 
@@ -123,6 +143,8 @@ Preprocessing is performed once on the full dataset before any fold split, using
    The original (pre-padding) length of each signal is recorded as `valid_lengths`. This array is passed to `extractor.py` so that feature computation is restricted to non-padded timesteps only, and to `cnn1d.py` for sequence-aware normalisation.
 
 ### Normalisation (per fold, in `run_pipeline.py`)
+
+All learned/statistical transformations, model fitting, and evaluation are performed within fold boundaries.
 
 - **Feature normalisation (LR / RF):** z-score standardisation is fitted exclusively on training-fold feature vectors and applied to both train and test.
 - **Sequence normalisation (CNN):** per-channel mean and standard deviation are computed from valid (non-padded) training timesteps only and applied to all timesteps (including padded) at inference.
@@ -217,11 +239,21 @@ All results are from 5-fold subject-independent cross-validation on the full PD 
 | Random Forest | 0.5301 ± 0.0120 | **0.7601 ± 0.0275** | 0.9860 ± 0.0070 | 0.0742 ± 0.0294 |
 | 1D CNN v2 | 0.6342 ± 0.0447 | 0.6921 ± 0.0515 | 0.6745 ± 0.0532 | 0.5939 ± 0.1073 |
 
-**Key observations:**
+**Interpreting these numbers honestly:**
 
-- Logistic Regression achieves the highest Balanced Accuracy and the most balanced sensitivity/specificity trade-off, suggesting that the hand-crafted feature representation captures discriminative structure effectively without collapsing to a majority-class bias.
-- Random Forest achieves the highest AUROC despite a low Balanced Accuracy. Its near-perfect sensitivity (0.9860) coupled with near-zero specificity (0.0742) indicates that it predicts PD for almost every sample at the default threshold, functioning as a strong ranker but a poorly calibrated classifier under class imbalance.
-- 1D CNN v2 is close to Logistic Regression in Balanced Accuracy and shows a more balanced sensitivity/specificity profile than the previous CNN baseline (sensitivity 0.8007, specificity 0.4224), reducing the gap between the two rates. The early stopping mechanism in CNN v2 helps prevent the model from over-optimising toward the majority class late in training.
+The goal of this benchmark is methodological rigour, not maximising reported performance. Under subject-independent evaluation, modest balanced accuracy is the expected outcome: models are evaluated on held-out subjects rather than held-out records from known subjects, which is a harder and more realistic problem.
+
+- **Logistic Regression** achieves the highest Balanced Accuracy and the most balanced sensitivity/specificity trade-off, suggesting that the hand-crafted feature representation captures discriminative structure without collapsing to a majority-class bias.
+- **Random Forest** achieves the highest AUROC but near-zero specificity (0.0742) at the default threshold — it predicts PD for almost every sample. This suggests threshold and calibration issues; it should not be interpreted as strong binary classification performance.
+- **1D CNN v2** is close to Logistic Regression in Balanced Accuracy and shows a more balanced sensitivity/specificity profile. Early stopping in v2 helps prevent the model from over-optimising toward the majority class late in training.
+
+These results should not be interpreted as a ceiling for PD detection from IMU signals. They reflect what is achievable with fixed hyperparameters, no architecture search, and a relatively small HC cohort — under conditions designed to avoid overfitting and leakage.
+
+---
+
+## Main Takeaway
+
+This project is valuable because it prioritises **leakage-free evaluation and reproducibility** over unrealistic performance claims. All learned transformations and model fitting are performed within fold boundaries, with no access to test-fold data. The reported numbers are conservative by design; they reflect generalisation to held-out subjects from the same dataset, which is a more meaningful evaluation than record-level splits.
 
 ---
 
@@ -237,8 +269,8 @@ All results are from 5-fold subject-independent cross-validation on the full PD 
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/<your-username>/<repo-name>.git
-cd <repo-name>
+git clone https://github.com/gabrielepecchi/pads-imu-parkinson-benchmark.git
+cd pads-imu-parkinson-benchmark
 
 # 2. Create and activate a virtual environment
 python3.12 -m venv .venv
@@ -249,7 +281,7 @@ source .venv/bin/activate       # Linux / macOS
 pip install -r requirements.txt
 ```
 
-### `requirements.txt` (minimum)
+### `requirements.txt` (minimum dependencies)
 
 ```
 numpy
@@ -382,7 +414,7 @@ After a completed pipeline run, two CSV files are written to `results/`:
 - [ ] Nested cross-validation for principled hyperparameter tuning, including CNN epoch count and learning rate.
 - [ ] Transformer-based sequence model (e.g. TST, PatchTST) as an additional baseline.
 - [ ] Feature importance analysis for the Random Forest and Logistic Regression pipelines.
-- [ ] Threshold optimisation for Random Forest evaluated under nested CV to avoid the specificity collapse observed at the default threshold.
+- [ ] Threshold optimisation for Random Forest evaluated under nested CV to address the specificity collapse observed at the default threshold.
 - [ ] Integration of additional PADS modalities (e.g. video, spiral drawing).
 - [ ] Statistical significance testing between model pairs (McNemar's test or permutation test).
 - [ ] ONNX / TorchScript export for deployment.
@@ -398,12 +430,12 @@ All sources of randomness are controlled via a single seed value (`random_seed: 
 - `random_forest.py` — `RandomForestClassifier(random_state=seed)`
 - `cnn1d.py` — `torch.manual_seed(seed)` and `np.random.seed(seed)`
 
-To reproduce the reported results exactly:
+The pipeline is designed to be reproducible under the same dataset, configuration, and environment:
 
-1. Use Python 3.12 with the dependency versions pinned in `requirements.txt`.
+1. Use Python 3.12 with compatible dependency versions (see `requirements.txt` for minimum versions).
 2. Use the PADS dataset at PhysioNet version 1.0.0.
 3. Run with the default `pipeline.yaml` without modification.
-4. GPU non-determinism: CUDA operations may introduce minor floating-point variance across runs on the CNN. Set `cnn_device: cpu` for fully deterministic CNN results at the cost of longer runtime.
+4. GPU non-determinism: CUDA operations may introduce minor floating-point variance across runs on the CNN. Set `cnn_device: cpu` for more deterministic CNN results at the cost of longer runtime.
 
 ---
 
@@ -420,12 +452,13 @@ The PADS dataset is subject to its own PhysioNet Credentialed Health Data Licens
 If you use this codebase in your research, please cite:
 
 ```bibtex
-@misc{yourname2024pads,
-  author       = {Your Name},
+@misc{pecchi2026pads,
+  author       = {Pecchi, Gabriele},
   title        = {Subject-Independent Benchmarking of Wearable IMU Models
                   for Parkinsonian Motor Symptom Classification},
-  year         = {2024},
-  howpublished = {\url{https://github.com/<your-username>/<repo-name>}},
+  year         = {2026},
+  howpublished = {GitHub repository},
+  url          = {https://github.com/gabrielepecchi/pads-imu-parkinson-benchmark}
 }
 ```
 
