@@ -1,7 +1,41 @@
-data/
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
 .venv/
 venv/
-__pycache__/
-*.pyc
+env/
+
+# Jupyter / editor / system files
 .ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+
+# Environment files
+.env
+.env.*
+
+# Raw/local data
+data/
+data/raw/
+data/pads/
+
+# Generated arrays and model artifacts
 results/*.npy
+results/*.npz
+*.pt
+*.pth
+*.ckpt
+*.pkl
+*.joblib
+
+# Logs
+*.log
+runs/
+tensorboard/
