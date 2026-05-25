@@ -1,0 +1,4 @@
+model,mean_balanced_accuracy,sd_balanced_accuracy,mean_auroc,sd_auroc,mean_sensitivity,sd_sensitivity,mean_specificity,sd_specificity,n_folds
+LR,0.644051,0.015610,0.702855,0.026058,0.643934,0.059002,0.644167,0.032884,5
+RF,0.530117,0.012023,0.760086,0.027544,0.986030,0.007019,0.074205,0.029396,5
+CNN,0.611552,0.069069,0.758758,0.045552,0.800717,0.216754,0.422386,0.345047,5
