@@ -25,6 +25,17 @@ Architecture (compact, ~50k parameters):
     Head   : Dropout(0.5) → Linear(128 → 2)
     Output : softmax probabilities  (N, 2)
 
+Early stopping (v2 stability improvement)
+------------------------------------------
+fit() reserves a small stratified validation split from the training fold
+(val_fraction=0.15 by default). Validation loss is evaluated at the end of
+each epoch using the weighted cross-entropy criterion. Training stops when
+validation loss has not improved for `patience` consecutive epochs (default
+patience=8). The network weights from the epoch with the lowest validation
+loss are restored before fit() returns. No test-fold data is involved at any
+point. The full training fold (train + val) is never seen by the model
+simultaneously during training — val samples are held out for monitoring only.
+
 Typical usage in run_pipeline.py:
     model = CNN1DModel(max_len=2048)
     model.fit(X_train_norm, y_train)          # X shape: (N_train, 2048, 6)
@@ -34,6 +45,7 @@ Typical usage in run_pipeline.py:
 
 from __future__ import annotations
 
+import copy
 import logging
 from dataclasses import dataclass, field
 
@@ -54,7 +66,7 @@ N_INPUT_CHANNELS: int = 6
 #: Number of output classes (HC=0, PD=1).
 N_CLASSES: int = 2
 
-#: Default training epochs.
+#: Default training epochs (upper bound; early stopping may stop earlier).
 DEFAULT_EPOCHS: int = 50
 
 #: Default mini-batch size.
@@ -68,6 +80,14 @@ DEFAULT_DROPOUT: float = 0.5
 
 #: Default random seed (weight initialisation + DataLoader shuffle).
 DEFAULT_RANDOM_STATE: int = 42
+
+#: Fraction of the training fold held out as the internal validation set.
+#: Stratified by label. Kept small to maximise training data.
+DEFAULT_VAL_FRACTION: float = 0.15
+
+#: Number of consecutive epochs with no validation-loss improvement before
+#: training is stopped and best weights are restored.
+DEFAULT_PATIENCE: int = 8
 
 
 # ---------------------------------------------------------------------------
@@ -191,11 +211,18 @@ class CNN1DModel:
     """1D-CNN classifier for PD / HC binary classification on the PADS benchmark.
 
     Wraps _CNN1DNetwork with training loop, class-weight-based loss weighting,
-    fit/predict interface, and basic state validation. All hyperparameters are
-    set at construction time and can be overridden for tuning runs.
+    early stopping with best-weight restoration, fit/predict interface, and
+    basic state validation. All hyperparameters are set at construction time
+    and can be overridden for tuning runs.
 
     Class imbalance is handled by passing class weights to
     nn.CrossEntropyLoss(weight=...), computed exclusively from training labels.
+
+    Early stopping monitors validation loss computed on a stratified holdout
+    split (val_fraction) drawn from the training fold only. When validation
+    loss has not improved for `patience` consecutive epochs the training loop
+    is terminated and the weights from the best epoch are restored. No test
+    data is used at any stage of this process.
 
     Parameters
     ----------
@@ -205,7 +232,8 @@ class CNN1DModel:
         for input validation; the network is length-agnostic via
         AdaptiveAvgPool1d.
     epochs : int
-        Number of full passes over the training set. Default: 50.
+        Maximum number of full passes over the training set. Default: 50.
+        Early stopping may halt training before this limit is reached.
     batch_size : int
         Mini-batch size for training and inference. Default: 32.
     lr : float
@@ -218,15 +246,28 @@ class CNN1DModel:
     device : str | None
         PyTorch device string ('cpu', 'cuda', 'mps'). If None, auto-detected:
         CUDA → MPS → CPU in order of preference. Default: None.
+    val_fraction : float
+        Fraction of the training fold to reserve as an internal validation
+        set for early stopping. Stratified by label. Default: 0.15.
+    patience : int
+        Number of consecutive epochs with no validation-loss improvement
+        before early stopping is triggered. Default: 8.
 
     Attributes
     ----------
     network_ : _CNN1DNetwork
-        Fitted PyTorch model. Available after fit() is called.
+        Fitted PyTorch model (weights from the best validation-loss epoch).
+        Available after fit() is called.
     class_weight_ : dict[int, float]
         Per-class weights computed from training labels during fit().
     train_loss_history_ : list[float]
-        Mean cross-entropy loss per epoch, recorded during fit().
+        Mean training cross-entropy loss per epoch, recorded during fit().
+    val_loss_history_ : list[float]
+        Mean validation cross-entropy loss per epoch, recorded during fit().
+    best_epoch_ : int
+        Zero-based epoch index at which the best validation loss was achieved.
+    best_val_loss_ : float
+        Best (lowest) validation loss observed during training.
     is_fitted_ : bool
         True after fit() has been called successfully.
     device_ : torch.device
@@ -242,21 +283,35 @@ class CNN1DModel:
         dropout: float = DEFAULT_DROPOUT,
         random_state: int = DEFAULT_RANDOM_STATE,
         device: str | None = None,
+        val_fraction: float = DEFAULT_VAL_FRACTION,
+        patience: int = DEFAULT_PATIENCE,
     ) -> None:
         if max_len < 1:
             raise ValueError(f"max_len must be >= 1, got {max_len}.")
+        if not (0.0 < val_fraction < 1.0):
+            raise ValueError(
+                f"val_fraction must be in (0, 1), got {val_fraction}."
+            )
+        if patience < 1:
+            raise ValueError(f"patience must be >= 1, got {patience}.")
+
         self.max_len = max_len
         self.epochs = epochs
         self.batch_size = batch_size
         self.lr = lr
         self.dropout = dropout
         self.random_state = random_state
+        self.val_fraction = val_fraction
+        self.patience = patience
 
         self.device_: torch.device = self._resolve_device(device)
 
         self.network_: _CNN1DNetwork | None = None
         self.class_weight_: dict[int, float] | None = None
         self.train_loss_history_: list[float] = []
+        self.val_loss_history_: list[float] = []
+        self.best_epoch_: int = 0
+        self.best_val_loss_: float = float("inf")
         self.is_fitted_: bool = False
 
     # ------------------------------------------------------------------
@@ -378,6 +433,76 @@ class CNN1DModel:
         """Convert (N,) integer label array to long tensor."""
         return torch.from_numpy(y.astype(np.int64))
 
+    def _stratified_val_split(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Split X and y into train/val subsets, stratified by label.
+
+        Each class is split independently at val_fraction so that the
+        class ratio is approximately preserved in both subsets. The split
+        is deterministic given self.random_state (set before this call).
+
+        Parameters
+        ----------
+        X : np.ndarray
+            Shape (N, max_len, 6).
+        y : np.ndarray
+            Shape (N,), values in {0, 1}.
+
+        Returns
+        -------
+        X_tr, y_tr, X_val, y_val : np.ndarray
+            Training and validation subsets. Both contain both classes.
+
+        Raises
+        ------
+        ValueError
+            If the validation split would leave fewer than 1 sample in either
+            class in either subset.
+        """
+        rng = np.random.RandomState(self.random_state)
+        train_idx: list[int] = []
+        val_idx: list[int] = []
+
+        for cls in (0, 1):
+            cls_idx = np.where(y == cls)[0]
+            rng.shuffle(cls_idx)
+            n_val = max(1, int(round(len(cls_idx) * self.val_fraction)))
+            # Guard: always keep at least 1 sample in training for this class.
+            n_val = min(n_val, len(cls_idx) - 1)
+            if n_val < 1:
+                raise ValueError(
+                    f"Val split for class {cls} would leave 0 training samples "
+                    f"(class count={len(cls_idx)}, val_fraction={self.val_fraction}). "
+                    "Reduce val_fraction or increase fold size."
+                )
+            val_idx.extend(cls_idx[:n_val].tolist())
+            train_idx.extend(cls_idx[n_val:].tolist())
+
+        train_idx_arr = np.array(train_idx, dtype=int)
+        val_idx_arr = np.array(val_idx, dtype=int)
+        return X[train_idx_arr], y[train_idx_arr], X[val_idx_arr], y[val_idx_arr]
+
+    def _eval_loss(
+        self,
+        loader: DataLoader,
+        criterion: nn.CrossEntropyLoss,
+        n_samples: int,
+    ) -> float:
+        """Compute mean weighted cross-entropy loss over a DataLoader in eval mode."""
+        self.network_.eval()  # type: ignore[union-attr]
+        total_loss = 0.0
+        with torch.no_grad():
+            for X_batch, y_batch in loader:
+                X_batch = X_batch.to(self.device_)
+                y_batch = y_batch.to(self.device_)
+                logits = self.network_(X_batch)  # type: ignore[union-attr]
+                loss = criterion(logits, y_batch)
+                total_loss += loss.item() * len(y_batch)
+        return total_loss / n_samples
+
     def _check_is_fitted(self) -> None:
         """Raise RuntimeError if the model has not been fitted."""
         if not self.is_fitted_ or self.network_ is None:
@@ -395,12 +520,17 @@ class CNN1DModel:
         X_train: np.ndarray,
         y_train: np.ndarray,
     ) -> "CNN1DModel":
-        """Train the 1D-CNN on pre-normalised sequence data.
+        """Train the 1D-CNN on pre-normalised sequence data with early stopping.
 
-        Builds and initialises a fresh _CNN1DNetwork, computes class weights
-        from y_train only, then runs the training loop for self.epochs epochs
-        using Adam and weighted cross-entropy loss. Loss per epoch is recorded
-        in self.train_loss_history_.
+        A stratified validation split (val_fraction of X_train) is held out
+        from the training loop and used exclusively to monitor validation loss.
+        Training stops when validation loss has not improved for `patience`
+        consecutive epochs. The network weights from the epoch with the lowest
+        validation loss are restored before this method returns.
+
+        Class weights are computed from all labels in y_train (including val
+        labels) so that the loss function reflects the full training-fold class
+        distribution. No test data is used at any point.
 
         Parameters
         ----------
@@ -423,7 +553,8 @@ class CNN1DModel:
             If X_train or y_train are not numpy arrays.
         ValueError
             If shapes are invalid, values are non-finite, labels are outside
-            {0, 1}, or a class is missing from y_train.
+            {0, 1}, a class is missing from y_train, or the val split cannot
+            be constructed (too few samples per class).
         """
         self._validate_X(X_train, name="X_train")
         self._validate_y(y_train, name="y_train")
@@ -435,7 +566,9 @@ class CNN1DModel:
 
         self._set_seed()
 
-        # Class weights computed from training labels only.
+        # --- Class weights from the full training-fold labels ---
+        # Computed before the val split so the loss weighting reflects the
+        # true training-fold class distribution.
         self.class_weight_ = self._compute_class_weights(y_train)
         loss_weights = torch.tensor(
             [self.class_weight_[0], self.class_weight_[1]],
@@ -443,66 +576,110 @@ class CNN1DModel:
             device=self.device_,
         )
 
-        # Build a fresh network for this fold.
+        # --- Stratified train / val split (from training fold only) ---
+        X_tr, y_tr, X_val, y_val = self._stratified_val_split(X_train, y_train)
+        logger.info(
+            "CNN1DModel: train split %d samples, val split %d samples "
+            "(val_fraction=%.2f).",
+            len(y_tr),
+            len(y_val),
+            self.val_fraction,
+        )
+
+        # --- Build network and optimiser ---
         self.network_ = _CNN1DNetwork(dropout=self.dropout).to(self.device_)
         optimizer = torch.optim.Adam(self.network_.parameters(), lr=self.lr)
         criterion = nn.CrossEntropyLoss(weight=loss_weights)
 
-        # DataLoader — shuffle uses the fixed seed set above.
-        X_tensor = self._to_tensor_X(X_train)
-        y_tensor = self._to_tensor_y(y_train)
-        dataset = TensorDataset(X_tensor, y_tensor)
-        loader = DataLoader(
-            dataset,
+        # --- DataLoaders ---
+        train_loader = DataLoader(
+            TensorDataset(self._to_tensor_X(X_tr), self._to_tensor_y(y_tr)),
             batch_size=self.batch_size,
             shuffle=True,
             drop_last=False,
             generator=torch.Generator().manual_seed(self.random_state),
         )
+        val_loader = DataLoader(
+            TensorDataset(self._to_tensor_X(X_val), self._to_tensor_y(y_val)),
+            batch_size=self.batch_size,
+            shuffle=False,
+        )
 
+        # --- Training loop with early stopping ---
         self.train_loss_history_ = []
-        self.network_.train()
+        self.val_loss_history_ = []
+        self.best_val_loss_ = float("inf")
+        self.best_epoch_ = 0
+        best_weights: dict = copy.deepcopy(self.network_.state_dict())
+        epochs_no_improve: int = 0
 
         for epoch in range(self.epochs):
-            epoch_loss = 0.0
-            for X_batch, y_batch in loader:
+            # -- Training pass --
+            self.network_.train()
+            epoch_train_loss = 0.0
+            for X_batch, y_batch in train_loader:
                 X_batch = X_batch.to(self.device_)
                 y_batch = y_batch.to(self.device_)
-
                 optimizer.zero_grad()
                 logits = self.network_(X_batch)
                 loss = criterion(logits, y_batch)
                 loss.backward()
                 optimizer.step()
+                epoch_train_loss += loss.item() * len(y_batch)
 
-                epoch_loss += loss.item() * len(y_batch)
+            mean_train_loss = epoch_train_loss / len(y_tr)
+            self.train_loss_history_.append(mean_train_loss)
 
-            mean_loss = epoch_loss / len(y_train)
-            self.train_loss_history_.append(mean_loss)
+            # -- Validation pass --
+            mean_val_loss = self._eval_loss(val_loader, criterion, len(y_val))
+            self.val_loss_history_.append(mean_val_loss)
 
             if (epoch + 1) % 10 == 0 or epoch == 0:
                 logger.debug(
-                    "Epoch %d/%d — mean loss: %.4f.",
+                    "Epoch %d/%d — train_loss: %.4f, val_loss: %.4f.",
                     epoch + 1,
                     self.epochs,
-                    mean_loss,
+                    mean_train_loss,
+                    mean_val_loss,
                 )
 
+            # -- Early stopping check --
+            if mean_val_loss < self.best_val_loss_:
+                self.best_val_loss_ = mean_val_loss
+                self.best_epoch_ = epoch
+                best_weights = copy.deepcopy(self.network_.state_dict())
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= self.patience:
+                    logger.info(
+                        "Early stopping triggered at epoch %d/%d "
+                        "(no val_loss improvement for %d consecutive epochs).",
+                        epoch + 1,
+                        self.epochs,
+                        self.patience,
+                    )
+                    break
+
+        # --- Restore best weights ---
+        self.network_.load_state_dict(best_weights)
         self.is_fitted_ = True
+
         logger.info(
-            "CNN1DModel fitted: %d samples, max_len=%d, epochs=%d, "
+            "CNN1DModel fitted: %d train samples (%d after val split), "
+            "max_len=%d, best_epoch=%d, best_val_loss=%.4f, "
             "batch_size=%d, lr=%.5f, device=%s, "
-            "class_weight={0: %.4f, 1: %.4f}, "
-            "final_loss=%.4f.",
+            "class_weight={0: %.4f, 1: %.4f}.",
             len(y_train),
+            len(y_tr),
             self.max_len,
-            self.epochs,
+            self.best_epoch_ + 1,
+            self.best_val_loss_,
             self.batch_size,
             self.lr,
             str(self.device_),
             self.class_weight_[0],
             self.class_weight_[1],
-            self.train_loss_history_[-1],
         )
         return self
 

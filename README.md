@@ -30,7 +30,7 @@ A benchmarking pipeline that evaluates classical machine learning and deep learn
 
 ## Project Overview
 
-This project implements a reproducible end-to-end benchmark for detecting Parkinsonian motor symptoms from wrist IMU signals. Using the publicly available PADS dataset (PhysioNet), three model classes are evaluated under a 5-fold subject-independent cross-validation protocol: Logistic Regression over hand-crafted features, Random Forest over the same feature set, and a 1D Convolutional Neural Network operating directly on raw signal windows.
+This project implements a reproducible end-to-end benchmark for detecting Parkinsonian motor symptoms from wrist IMU signals. Using the publicly available PADS dataset (PhysioNet), three model classes are evaluated under a 5-fold subject-independent cross-validation protocol: Logistic Regression over hand-crafted features, Random Forest over the same feature set, and a 1D Convolutional Neural Network v2 operating directly on raw signal windows.
 
 The design strictly enforces subject independence — all records from a given subject remain in a single fold partition throughout training and evaluation, preventing any form of subject-level data leakage.
 
@@ -40,7 +40,7 @@ The design strictly enforces subject independence — all records from a given s
 
 - Establish a clean, reproducible baseline for PD vs. HC classification on the PADS wrist IMU benchmark.
 - Enforce subject-independent evaluation to produce generalisation estimates that are meaningful in a clinical deployment context.
-- Compare classical feature-engineering pipelines (Logistic Regression, Random Forest) against an end-to-end deep learning approach (1D CNN).
+- Compare classical feature-engineering pipelines (Logistic Regression, Random Forest) against an end-to-end deep learning approach (1D CNN v2).
 - Report Balanced Accuracy, AUROC, Sensitivity (PD), and Specificity (HC) across five folds, with mean ± standard deviation, to reflect class imbalance and ranking performance simultaneously.
 
 ---
@@ -89,7 +89,7 @@ Normalisation      — z-score fitted on training fold only (run_pipeline.py)
      │
      ├──► logistic_regression.py   — LR with balanced class weights
      ├──► random_forest.py         — RF with balanced class weights
-     └──► cnn1d.py                 — 1D CNN on normalised raw signal windows
+     └──► cnn1d.py                 — 1D CNN v2 on normalised raw signal windows
                 │
                 ▼
            metrics.py              — Balanced Accuracy, AUROC, Sensitivity (PD), Specificity (HC) per fold
@@ -176,17 +176,19 @@ Operates on z-scored hand-crafted features produced by `extractor.py`.
 
 Operates on the same normalised feature set as Logistic Regression.
 
-### 1D CNN (`cnn1d.py`)
+### 1D CNN v2 (`cnn1d.py`)
 
 | Hyperparameter | Value |
 |---|---|
-| Epochs | 50 |
+| Epochs | 10 |
 | Batch size | 32 |
 | Learning rate | 0.001 |
 | Dropout | 0.5 |
 | Device | CUDA (CPU fallback) |
 
 Operates directly on the normalised raw signal windows `(batch, 6, max_len)`. The network is trained independently for each fold; no weights are shared across folds.
+
+CNN v2 introduces an internal stratified validation split derived from the training fold only. Early stopping monitors validation loss with a patience of 8 epochs and restores the best weights before evaluation. The test fold is never used to inform training or early stopping decisions, preserving strict subject-independent evaluation.
 
 ---
 
@@ -213,13 +215,13 @@ All results are from 5-fold subject-independent cross-validation on the full PD 
 |---|---|---|---|---|
 | Logistic Regression | **0.6441 ± 0.0156** | 0.7029 ± 0.0261 | 0.6439 ± 0.0590 | 0.6442 ± 0.0329 |
 | Random Forest | 0.5301 ± 0.0120 | **0.7601 ± 0.0275** | 0.9860 ± 0.0070 | 0.0742 ± 0.0294 |
-| 1D CNN | 0.6116 ± 0.0691 | 0.7588 ± 0.0456 | 0.8007 ± 0.2168 | 0.4224 ± 0.3450 |
+| 1D CNN v2 | 0.6342 ± 0.0447 | 0.6921 ± 0.0515 | 0.6745 ± 0.0532 | 0.5939 ± 0.1073 |
 
 **Key observations:**
 
 - Logistic Regression achieves the highest Balanced Accuracy and the most balanced sensitivity/specificity trade-off, suggesting that the hand-crafted feature representation captures discriminative structure effectively without collapsing to a majority-class bias.
-- Random Forest achieves the highest AUROC despite a very low Balanced Accuracy. Its near-perfect sensitivity (0.9860) coupled with near-zero specificity (0.0742) indicates that it predicts PD for almost every sample at the default threshold, functioning as a strong ranker but a poorly calibrated classifier under class imbalance.
-- The 1D CNN shows competitive AUROC but high variance across folds in both sensitivity and specificity, consistent with the limited training set size per fold and sensitivity to random initialisation.
+- Random Forest achieves the highest AUROC despite a low Balanced Accuracy. Its near-perfect sensitivity (0.9860) coupled with near-zero specificity (0.0742) indicates that it predicts PD for almost every sample at the default threshold, functioning as a strong ranker but a poorly calibrated classifier under class imbalance.
+- 1D CNN v2 is close to Logistic Regression in Balanced Accuracy and shows a more balanced sensitivity/specificity profile than the previous CNN baseline (sensitivity 0.8007, specificity 0.4224), reducing the gap between the two rates. The early stopping mechanism in CNN v2 helps prevent the model from over-optimising toward the majority class late in training.
 
 ---
 
@@ -262,7 +264,7 @@ pyyaml
 
 ## CUDA / GPU Notes
 
-The 1D CNN (`cnn1d.py`) uses PyTorch and will automatically use CUDA if available. The pipeline has been tested on an **NVIDIA RTX 3050 Laptop GPU**.
+The 1D CNN v2 (`cnn1d.py`) uses PyTorch and will automatically use CUDA if available. The pipeline has been tested on an **NVIDIA RTX 3050 Laptop GPU**.
 
 To install PyTorch with CUDA 12.x support:
 
@@ -368,8 +370,8 @@ After a completed pipeline run, two CSV files are written to `results/`:
 - **Binary classification only.** Other Movement Disorders (DD subjects) are excluded at the loading stage; multi-class extension is not supported.
 - **No hyperparameter optimisation.** All model hyperparameters are fixed at the values specified in `pipeline.yaml`. No nested CV or grid search is performed.
 - **Feature set not ablated.** The hand-crafted feature set in `extractor.py` is used as-is; no feature importance analysis or selection is included.
-- **CNN architecture not tuned.** The 1D CNN architecture and training schedule are fixed; no architecture search is performed.
-- **Small HC cohort.** The HC group in PADS is smaller than the PD group, which limits the statistical power of per-fold estimates and increases fold-to-fold variance.
+- **CNN architecture not tuned.** The 1D CNN v2 architecture and training schedule are fixed; no architecture search is performed.
+- **Small HC cohort.** The HC group in PADS is smaller than the PD group, which limits the statistical power of per-fold estimates and increases fold-to-fold variance, particularly for the CNN.
 - **No confidence intervals beyond ± std.** Bootstrapped confidence intervals or permutation tests are not computed.
 
 ---
@@ -377,9 +379,10 @@ After a completed pipeline run, two CSV files are written to `results/`:
 ## Future Improvements
 
 - [ ] Bilateral sensor fusion (dominant + non-dominant wrist).
-- [ ] Nested cross-validation for principled hyperparameter tuning.
+- [ ] Nested cross-validation for principled hyperparameter tuning, including CNN epoch count and learning rate.
 - [ ] Transformer-based sequence model (e.g. TST, PatchTST) as an additional baseline.
 - [ ] Feature importance analysis for the Random Forest and Logistic Regression pipelines.
+- [ ] Threshold optimisation for Random Forest evaluated under nested CV to avoid the specificity collapse observed at the default threshold.
 - [ ] Integration of additional PADS modalities (e.g. video, spiral drawing).
 - [ ] Statistical significance testing between model pairs (McNemar's test or permutation test).
 - [ ] ONNX / TorchScript export for deployment.
