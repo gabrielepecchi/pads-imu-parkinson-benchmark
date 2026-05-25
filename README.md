@@ -1,5 +1,7 @@
 # Subject-Independent Benchmarking of Wearable IMU Models for Parkinsonian Motor Symptom Classification
 
+[![Tests](https://github.com/gabrielepecchi/pads-imu-parkinson-benchmark/actions/workflows/tests.yml/badge.svg)](https://github.com/gabrielepecchi/pads-imu-parkinson-benchmark/actions/workflows/tests.yml)
+
 A benchmarking pipeline that evaluates classical machine learning and deep learning models for binary Parkinson's Disease (PD) vs. Healthy Control (HC) classification using wrist-worn inertial measurement unit (IMU) signals from the PADS dataset, under a strict subject-independent cross-validation protocol.
 
 ---
